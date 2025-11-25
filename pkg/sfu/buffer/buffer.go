@@ -796,6 +796,43 @@ func (b *Buffer) patchExtPacket(ep *ExtPacket, buf []byte) *ExtPacket {
 	return ep
 }
 
+func (b *Buffer) ReplaceExtPacket(ep *ExtPacket, payload []byte) (*ExtPacket, error) {
+	b.Lock()
+	defer b.Unlock()
+
+	if b.closed.Load() {
+		return nil, io.EOF
+	}
+
+	pkt := *ep.Packet
+	pkt.Payload = payload
+
+	raw, err := pkt.Marshal()
+	if err != nil {
+		return nil, err
+	}
+	if len(raw) > bucket.MaxPktSize {
+		return nil, bucket.ErrPacketTooLarge
+	}
+
+	storedPkt, err := b.bucket.AddPacketWithSequenceNumber(raw, ep.ExtSequenceNumber)
+	if err != nil {
+		return nil, err
+	}
+
+	payloadStart := pkt.Header.MarshalSize()
+	payloadEnd := payloadStart + len(payload)
+	if payloadEnd > len(storedPkt) {
+		return nil, errors.New("payload size mismatch")
+	}
+	pkt.Payload = storedPkt[payloadStart:payloadEnd]
+
+	ep.Packet = &pkt
+	ep.RawPacket = storedPkt
+
+	return ep, nil
+}
+
 func (b *Buffer) doFpsCalc(ep *ExtPacket) {
 	if b.paused || b.frameRateCalculated || len(ep.Packet.Payload) == 0 {
 		return

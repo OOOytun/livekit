@@ -15,6 +15,8 @@
 package prometheus
 
 import (
+	"time"
+
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/atomic"
 
@@ -50,25 +52,28 @@ var (
 	forwardLatency             atomic.Uint32
 	forwardJitter              atomic.Uint32
 
-	promPacketLabels          = []string{"direction", "transmission", "country"}
-	promPacketTotal           *prometheus.CounterVec
-	promPacketBytes           *prometheus.CounterVec
-	promRTCPLabels            = []string{"direction", "country"}
-	promStreamLabels          = []string{"direction", "source", "type", "country"}
-	promNackTotal             *prometheus.CounterVec
-	promPliTotal              *prometheus.CounterVec
-	promFirTotal              *prometheus.CounterVec
-	promPacketLossTotal       *prometheus.CounterVec
-	promPacketLoss            *prometheus.HistogramVec
-	promPacketOutOfOrderTotal *prometheus.CounterVec
-	promPacketOutOfOrder      *prometheus.HistogramVec
-	promJitter                *prometheus.HistogramVec
-	promRTT                   *prometheus.HistogramVec
-	promParticipantJoin       *prometheus.CounterVec
-	promConnections           *prometheus.GaugeVec
-	promForwardLatency        prometheus.Gauge
-	promForwardJitter         prometheus.Gauge
-	promForwardLatencyHist    prometheus.Histogram
+	promPacketLabels           = []string{"direction", "transmission", "country"}
+	promPacketTotal            *prometheus.CounterVec
+	promPacketBytes            *prometheus.CounterVec
+	promRTCPLabels             = []string{"direction", "country"}
+	promStreamLabels           = []string{"direction", "source", "type", "country"}
+	promNackTotal              *prometheus.CounterVec
+	promPliTotal               *prometheus.CounterVec
+	promFirTotal               *prometheus.CounterVec
+	promPacketLossTotal        *prometheus.CounterVec
+	promPacketLoss             *prometheus.HistogramVec
+	promPacketOutOfOrderTotal  *prometheus.CounterVec
+	promPacketOutOfOrder       *prometheus.HistogramVec
+	promJitter                 *prometheus.HistogramVec
+	promRTT                    *prometheus.HistogramVec
+	promParticipantJoin        *prometheus.CounterVec
+	promConnections            *prometheus.GaugeVec
+	promForwardLatency         prometheus.Gauge
+	promForwardJitter          prometheus.Gauge
+	promForwardLatencyHist     prometheus.Histogram
+	promAudioProcessorDuration prometheus.Histogram
+	promAudioProcessorOverrun  prometheus.Counter
+	promAudioProcessorFailure  prometheus.Counter
 
 	promPacketTotalIncomingInitial    prometheus.Counter
 	promPacketTotalIncomingRetransmit prometheus.Counter
@@ -195,6 +200,37 @@ func initPacketStats(nodeID string, nodeType livekit.NodeType) {
 			20 * 1000 * 1000,
 		},
 	})
+	promAudioProcessorDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Namespace:   livekitNamespace,
+		Subsystem:   "audio_processor",
+		Name:        "duration_ns",
+		ConstLabels: prometheus.Labels{"node_id": nodeID, "node_type": nodeType.String()},
+		// 50us, 100us, 250us, 500us, 1ms, 2ms, 3ms, 5ms, 10ms, 20ms
+		Buckets: []float64{
+			50 * 1000,
+			100 * 1000,
+			250 * 1000,
+			500 * 1000,
+			1 * 1000 * 1000,
+			2 * 1000 * 1000,
+			3 * 1000 * 1000,
+			5 * 1000 * 1000,
+			10 * 1000 * 1000,
+			20 * 1000 * 1000,
+		},
+	})
+	promAudioProcessorOverrun = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace:   livekitNamespace,
+		Subsystem:   "audio_processor",
+		Name:        "overrun_total",
+		ConstLabels: prometheus.Labels{"node_id": nodeID, "node_type": nodeType.String()},
+	})
+	promAudioProcessorFailure = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace:   livekitNamespace,
+		Subsystem:   "audio_processor",
+		Name:        "failure_total",
+		ConstLabels: prometheus.Labels{"node_id": nodeID, "node_type": nodeType.String()},
+	})
 
 	prometheus.MustRegister(promPacketTotal)
 	prometheus.MustRegister(promPacketBytes)
@@ -212,6 +248,9 @@ func initPacketStats(nodeID string, nodeType livekit.NodeType) {
 	prometheus.MustRegister(promForwardLatency)
 	prometheus.MustRegister(promForwardJitter)
 	prometheus.MustRegister(promForwardLatencyHist)
+	prometheus.MustRegister(promAudioProcessorDuration)
+	prometheus.MustRegister(promAudioProcessorOverrun)
+	prometheus.MustRegister(promAudioProcessorFailure)
 }
 
 func IncrementPackets(country string, direction Direction, count uint64, retransmit bool) {
@@ -356,4 +395,16 @@ func RecordForwardLatency(longTermLatencyAvg uint32) {
 func RecordForwardJitter(longTermJitterAvg uint32) {
 	forwardJitter.Store(longTermJitterAvg)
 	promForwardJitter.Set(float64(longTermJitterAvg))
+}
+
+func RecordAudioProcessorDuration(d time.Duration) {
+	promAudioProcessorDuration.Observe(float64(d.Nanoseconds()))
+}
+
+func RecordAudioProcessorOverrun() {
+	promAudioProcessorOverrun.Inc()
+}
+
+func RecordAudioProcessorFailure() {
+	promAudioProcessorFailure.Inc()
 }

@@ -248,6 +248,8 @@ keys:
 #   smooth_intervals: 4
 #   # enable red encoding downtrack for opus only audio up track
 #   active_red_encoding: true
+#   # enable audio processor for incoming audio tracks
+#   audio_processor_enabled: false
 
 # turn server
 # turn:

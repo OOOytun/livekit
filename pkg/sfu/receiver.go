@@ -24,6 +24,7 @@ import (
 	"github.com/pion/rtcp"
 	"github.com/pion/webrtc/v4"
 	"go.uber.org/atomic"
+	gopus "gopkg.in/hraban/opus.v2"
 
 	"github.com/livekit/mediatransportutil/pkg/bucket"
 	"github.com/livekit/protocol/livekit"
@@ -37,6 +38,7 @@ import (
 	"github.com/livekit/livekit-server/pkg/sfu/mime"
 	"github.com/livekit/livekit-server/pkg/sfu/rtpstats"
 	"github.com/livekit/livekit-server/pkg/sfu/streamtracker"
+	promstats "github.com/livekit/livekit-server/pkg/telemetry/prometheus"
 )
 
 var (
@@ -68,6 +70,10 @@ var (
 type AudioConfig struct {
 	audio.AudioLevelConfig `yaml:",inline"`
 
+	// enable audio processor for incoming audio tracks
+	AudioProcessorEnabled bool `yaml:"audio_processor_enabled,omitempty"`
+	// factory used to build per-track audio processors
+	ProcessorFactory audio.ProcessorFactory `yaml:"-"`
 	// enable red encoding downtrack for opus only audio up track
 	ActiveREDEncoding bool `yaml:"active_red_encoding,omitempty"`
 	// enable proxying weakest subscriber loss to publisher in RTCP Receiver Report
@@ -76,11 +82,22 @@ type AudioConfig struct {
 
 var (
 	DefaultAudioConfig = AudioConfig{
-		AudioLevelConfig: audio.DefaultAudioLevelConfig,
+		AudioLevelConfig:      audio.DefaultAudioLevelConfig,
+		AudioProcessorEnabled: false,
+		ProcessorFactory:      audio.NoopProcessorFactory,
 	}
 )
 
 // --------------------------------------
+
+const (
+	audioProcessorSampleRate   = 48000
+	audioProcessorChannels     = 1
+	audioProcessorFrameSize    = audioProcessorSampleRate / 50 // 20ms
+	audioProcessorTimeBudget   = 2 * time.Millisecond
+	minAudioEncodedBufferBytes = 1
+	audioProcessorFailureLimit = 3
+)
 
 type AudioLevelHandle func(level uint8, duration uint32)
 
@@ -165,8 +182,16 @@ var _ TrackReceiver = (*WebRTCReceiver)(nil)
 type WebRTCReceiver struct {
 	logger logger.Logger
 
-	pliThrottleConfig PLIThrottleConfig
-	audioConfig       AudioConfig
+	pliThrottleConfig          PLIThrottleConfig
+	audioConfig                AudioConfig
+	audioProcessor             audio.Processor
+	audioDecoder               *gopus.Decoder
+	audioEncoder               *gopus.Encoder
+	audioPCMBuffer             []float32
+	audioInitOnce              sync.Once
+	audioInitErr               error
+	audioProcessorFailureCount int
+	audioProcessorDisabled     atomic.Bool
 
 	trackID            livekit.TrackID
 	streamID           string
@@ -222,6 +247,9 @@ func WithPliThrottleConfig(pliThrottleConfig PLIThrottleConfig) ReceiverOpts {
 // WithAudioConfig sets up parameters for active speaker detection
 func WithAudioConfig(audioConfig AudioConfig) ReceiverOpts {
 	return func(w *WebRTCReceiver) *WebRTCReceiver {
+		if audioConfig.ProcessorFactory == nil {
+			audioConfig.ProcessorFactory = audio.NoopProcessorFactory
+		}
 		w.audioConfig = audioConfig
 		return w
 	}
@@ -754,6 +782,132 @@ func (w *WebRTCReceiver) GetLastSenderReportTime() time.Time {
 	return latestSRTime
 }
 
+func (w *WebRTCReceiver) shouldProcessAudio() bool {
+	return w.kind == webrtc.RTPCodecTypeAudio &&
+		w.audioConfig.AudioProcessorEnabled &&
+		!w.audioProcessorDisabled.Load() &&
+		mime.NormalizeMimeType(w.codec.MimeType) == mime.MimeTypeOpus
+}
+
+func (w *WebRTCReceiver) ensureAudioProcessor() error {
+	w.audioInitOnce.Do(func() {
+		if w.audioConfig.ProcessorFactory == nil {
+			w.audioConfig.ProcessorFactory = audio.NoopProcessorFactory
+		}
+
+		var err error
+		w.audioDecoder, err = gopus.NewDecoder(audioProcessorSampleRate, audioProcessorChannels)
+		if err != nil {
+			w.audioInitErr = err
+			return
+		}
+
+		w.audioEncoder, err = gopus.NewEncoder(audioProcessorSampleRate, audioProcessorChannels, gopus.AppAudio)
+		if err != nil {
+			w.audioInitErr = err
+			return
+		}
+		_ = w.audioEncoder.SetBitrateToAuto()
+
+		w.audioProcessor = w.audioConfig.ProcessorFactory.NewProcessor(w.trackID)
+		w.audioPCMBuffer = make([]float32, audioProcessorFrameSize*audioProcessorChannels)
+	})
+
+	return w.audioInitErr
+}
+
+func (w *WebRTCReceiver) markAudioProcessorFailure(reason string) {
+	promstats.RecordAudioProcessorFailure()
+
+	w.audioProcessorFailureCount++
+	if w.audioProcessorFailureCount >= audioProcessorFailureLimit && !w.audioProcessorDisabled.Swap(true) {
+		w.logger.Warnw("disabling audio processor after repeated failures", nil, "failures", w.audioProcessorFailureCount, "reason", reason)
+	}
+}
+
+func (w *WebRTCReceiver) processAudioPacket(pkt *buffer.ExtPacket, buff *buffer.Buffer) *buffer.ExtPacket {
+	if !w.shouldProcessAudio() {
+		return pkt
+	}
+
+	start := time.Now()
+	overrun := false
+	success := false
+	defer func() {
+		promstats.RecordAudioProcessorDuration(time.Since(start))
+		if overrun {
+			promstats.RecordAudioProcessorOverrun()
+		}
+		if success {
+			w.audioProcessorFailureCount = 0
+		}
+	}()
+
+	if err := w.ensureAudioProcessor(); err != nil {
+		w.markAudioProcessorFailure("init")
+		return pkt
+	}
+	if w.audioProcessor == nil || w.audioDecoder == nil || w.audioEncoder == nil || len(pkt.Packet.Payload) == 0 {
+		return pkt
+	}
+
+	if len(w.audioPCMBuffer) < audioProcessorFrameSize*audioProcessorChannels {
+		w.audioPCMBuffer = make([]float32, audioProcessorFrameSize*audioProcessorChannels)
+	}
+
+	samples, err := w.audioDecoder.DecodeFloat32(pkt.Packet.Payload, w.audioPCMBuffer)
+	if err != nil || samples != audioProcessorFrameSize {
+		w.markAudioProcessorFailure("decode")
+		return pkt
+	}
+
+	pcm := w.audioPCMBuffer[:samples*audioProcessorChannels]
+
+	if time.Since(start) > audioProcessorTimeBudget {
+		overrun = true
+		w.markAudioProcessorFailure("overrun_decode")
+		return pkt
+	}
+
+	if !w.audioProcessor.ProcessPCM(pcm) {
+		success = true
+		return pkt
+	}
+
+	if time.Since(start) > audioProcessorTimeBudget {
+		overrun = true
+		w.markAudioProcessorFailure("overrun_process")
+		return pkt
+	}
+
+	encodedSize := len(pkt.Packet.Payload)
+	if encodedSize < minAudioEncodedBufferBytes {
+		encodedSize = minAudioEncodedBufferBytes
+	}
+	encodedPayload := make([]byte, encodedSize)
+	n, err := w.audioEncoder.EncodeFloat32(pcm, encodedPayload)
+	if err != nil {
+		w.markAudioProcessorFailure("encode")
+		return pkt
+	}
+	encodedPayload = encodedPayload[:n]
+
+	if time.Since(start) > audioProcessorTimeBudget {
+		overrun = true
+		w.markAudioProcessorFailure("overrun_encode")
+		return pkt
+	}
+
+	processed, err := buff.ReplaceExtPacket(pkt, encodedPayload)
+	if err != nil {
+		w.markAudioProcessorFailure("store")
+		return pkt
+	}
+
+	success = true
+	return processed
+}
+
 func (w *WebRTCReceiver) forwardRTP(layer int32, buff *buffer.Buffer) {
 	numPacketsForwarded := 0
 	numPacketsDropped := 0
@@ -803,6 +957,10 @@ func (w *WebRTCReceiver) forwardRTP(layer int32, buff *buffer.Buffer) {
 			)
 			numPacketsDropped++
 			continue
+		}
+
+		if processed := w.processAudioPacket(pkt, buff); processed != nil {
+			pkt = processed
 		}
 
 		spatialLayer := layer

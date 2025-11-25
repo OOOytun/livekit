@@ -59,6 +59,7 @@ require (
 	golang.org/x/mod v0.30.0
 	golang.org/x/sync v0.18.0
 	google.golang.org/protobuf v1.36.10
+	gopkg.in/hraban/opus.v2 v2.0.0-20230925203106-0188a62cb302
 	gopkg.in/yaml.v3 v3.0.1
 )
 
